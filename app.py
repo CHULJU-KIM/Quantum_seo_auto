@@ -9,7 +9,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 st.set_page_config(
-    page_title="무재고 위탁판매 SEO 자동화 솔루션",
+    page_title="무재고 위탁판매 SEO 자동화 대시보드",
     page_icon="⚡",
     layout="wide"
 )
@@ -53,7 +53,6 @@ def process_batch_gemini(client, model_name: str, batch_items: list[dict], statu
     """
     prompt_text = "다음 상품 목록을 최적화하라:\n" + json.dumps(batch_items, ensure_ascii=False)
 
-    # 503 서버 과부하 및 429 할당량 지연 시 최대 4회 지수 백오프 자동 재시도
     for attempt in range(4):
         try:
             response = client.models.generate_content(
@@ -73,10 +72,16 @@ def process_batch_gemini(client, model_name: str, batch_items: list[dict], statu
             if any(code in err_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]) and "402" not in err_msg:
                 if attempt < 3:
                     wait_sec = 4 * (attempt + 1)
-                    status_box.warning(f"⏳ 구글 서버 대기열 혼잡으로 {wait_sec}초 후 자동 재시도합니다... ({attempt + 1}/3회)")
+                    status_box.warning(f"⏳ 구글 서버 혼잡으로 {wait_sec}초 후 자동 재시도합니다... ({attempt + 1}/3회)")
                     time.sleep(wait_sec)
                     continue
             raise e
+
+# 세션 상태 초기화 (데이터 안전성 보장: 새로고침 시 날아감 방지)
+if "processed_df" not in st.session_state:
+    st.session_state.processed_df = None
+if "is_completed" not in st.session_state:
+    st.session_state.is_completed = False
 
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
@@ -84,10 +89,10 @@ with st.sidebar:
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     
     user_input_key = st.text_input(
-        "🔑 내 Gemini API 키 입력 (선택)",
+        "🔑 내 Gemini API 키 입력",
         type="password",
-        placeholder="비워두면 기본 시스템 키로 작동",
-        help="본인 명의의 무료 API 키를 입력하면 최우선으로 적용됩니다."
+        placeholder="선불 결제된 API 키 입력",
+        help="선불 충전된 본인의 API 키를 입력하면 최우선 적용됩니다."
     )
     
     if user_input_key.strip():
@@ -100,28 +105,24 @@ with st.sidebar:
         api_key = ""
         st.warning("⚠️ API 키를 입력해주세요.")
 
-    # 모델 선택 옵션 (503 과부하 시 우회 가능하도록 설계)
     model_choice = st.selectbox(
         "🤖 AI 엔진 선택",
-        options=[
-            "gemini-3.8-flash",
-            "gemini-3.8-flash-lite",
-            "gemini-2.0-flash"
-        ],
+        options=["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-2.0-flash"],
         index=0,
-        help="503 서버 혼잡 에러가 잦을 경우 더 가볍고 빠른 'lite' 모델을 선택하세요."
+        help="서버 혼잡(503) 시 lite 모델로 변경하세요."
     )
         
+    # 토큰 효율과 속도를 위해 기본값을 20개로 상향하여 프롬프트 반복 호출 비용 대폭 절감
     batch_size = st.slider(
         "📦 묶음 처리 단위", 
-        min_value=5, max_value=20, value=10, step=5,
-        help="무료 API 키 사용 시 5~10개로 설정하면 서버 과부하(503) 없이 가장 안정적으로 통과됩니다."
+        min_value=10, max_value=30, value=20, step=5,
+        help="한 번에 처리할 상품 수 (20개 설정 시 입력 토큰 비용 및 왕복 횟수가 대폭 절감됩니다)"
     )
     st.markdown("---")
     st.caption("by **Quantum CJ**")
 
 st.title("⚡ 무재고 위탁판매 SEO·태그·카테고리 자동화 대시보드")
-st.markdown("도매처 원본 엑셀을 업로드하고 **상품명 열(Column)**만 지정하면, 최적화된 상품명 3종과 중복 없는 태그 10개를 자동으로 생성하여 엑셀 우측에 붙여줍니다.")
+st.markdown("도매처 원본 엑셀을 업로드하면 최적화된 상품명 3종과 태그 10개가 안전하게 추가됩니다.")
 
 uploaded_file = st.file_uploader("📂 1단계: 도매처 원본 엑셀/CSV 파일을 여기에 끌어다 놓으세요", type=["xlsx", "xls", "csv"])
 
@@ -159,7 +160,6 @@ if uploaded_file:
             st.error("⚠️ 왼쪽 설정창에 Gemini API 키를 먼저 입력해주세요.")
             st.stop()
 
-        # v1beta 명시로 400 에러 원천 차단
         client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
         total_rows = len(df)
         results_map = {}
@@ -175,6 +175,7 @@ if uploaded_file:
         total_batches = (total_rows + batch_size - 1) // batch_size
         start_time = time.time()
 
+        success_flag = True
         for b_idx in range(total_batches):
             batch_slice = cleaned_items[b_idx * batch_size : (b_idx + 1) * batch_size]
             status_text.info(f"⏳ AI가 상품명을 다듬고 있습니다... ({b_idx + 1}/{total_batches} 구간 처리 중)")
@@ -185,34 +186,42 @@ if uploaded_file:
                     results_map[item['row_id']] = item
             except Exception as e:
                 st.error(f"⚠️ {b_idx + 1}구간 처리 실패: {e}")
+                success_flag = False
+                break
 
             progress_bar.progress((b_idx + 1) / total_batches)
-            time.sleep(1.5)  # 무료 API 분당 호출 제한 및 503 방지용 안전 간격
+            time.sleep(0.8)
 
-        df['[AI] 1차정제_상품명'] = [item['raw_title'] for item in cleaned_items]
-        df['[AI] 추천_카테고리'] = [results_map.get(i, {}).get('category', '미분류') for i in range(total_rows)]
-        df['[AI] SEO상품명_기본형'] = [results_map.get(i, {}).get('title_basic', '') for i in range(total_rows)]
-        df['[AI] SEO상품명_타겟형'] = [results_map.get(i, {}).get('title_target', '') for i in range(total_rows)]
-        df['[AI] SEO상품명_기능형'] = [results_map.get(i, {}).get('title_feature', '') for i in range(total_rows)]
-        df['[AI] 네이버태그_10개'] = [", ".join(results_map.get(i, {}).get('tags', [])) for i in range(total_rows)]
+        if success_flag:
+            df['[AI] 1차정제_상품명'] = [item['raw_title'] for item in cleaned_items]
+            df['[AI] 추천_카테고리'] = [results_map.get(i, {}).get('category', '미분류') for i in range(total_rows)]
+            df['[AI] SEO상품명_기본형'] = [results_map.get(i, {}).get('title_basic', '') for i in range(total_rows)]
+            df['[AI] SEO상품명_타겟형'] = [results_map.get(i, {}).get('title_target', '') for i in range(total_rows)]
+            df['[AI] SEO상품명_기능형'] = [results_map.get(i, {}).get('title_feature', '') for i in range(total_rows)]
+            df['[AI] 네이버태그_10개'] = [", ".join(results_map.get(i, {}).get('tags', [])) for i in range(total_rows)]
 
-        elapsed = round(time.time() - start_time, 1)
-        status_text.success(f"🎉 총 {total_rows:,}개 상품 최적화 완료! ({elapsed}초 소요)")
+            st.session_state.processed_df = df
+            st.session_state.is_completed = True
+            
+            elapsed = round(time.time() - start_time, 1)
+            status_text.success(f"🎉 총 {total_rows:,}개 상품 최적화 완료! ({elapsed}초 소요)")
 
-        st.subheader("📊 변환 결과 확인 (상위 10개)")
-        preview_cols = [target_col, '[AI] 추천_카테고리', '[AI] SEO상품명_기본형', '[AI] SEO상품명_타겟형', '[AI] SEO상품명_기능형', '[AI] 네이버태그_10개']
-        st.dataframe(df[preview_cols].head(10), use_container_width=True)
+if st.session_state.is_completed and st.session_state.processed_df is not None:
+    st.subheader("📊 변환 결과 확인 (상위 10개)")
+    result_df = st.session_state.processed_df
+    preview_cols = [c for c in result_df.columns if c.startswith('[AI]') or c == result_df.columns[0]]
+    st.dataframe(result_df.head(10), use_container_width=True)
 
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='SEO최적화완료')
-        excel_data = output.getvalue()
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        result_df.to_excel(writer, index=False, sheet_name='SEO최적화완료')
+    excel_data = output.getvalue()
 
-        st.download_button(
-            label="📥 4단계: 완성된 엑셀 파일 다운로드 (.xlsx)",
-            data=excel_data,
-            file_name=f"SEO최적화완료_{uploaded_file.name.split('.')[0]}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-            use_container_width=True
-        )
+    st.download_button(
+        label="📥 4단계: 완성된 엑셀 파일 다운로드 (.xlsx)",
+        data=excel_data,
+        file_name=f"SEO최적화완료_{uploaded_file.name if uploaded_file else 'result'}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True
+    )
