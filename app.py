@@ -54,7 +54,7 @@ def process_batch_gemini(client, batch_items: list[dict]) -> list[dict]:
     prompt_text = "다음 상품 목록을 최적화하라:\n" + json.dumps(batch_items, ensure_ascii=False)
 
     response = client.models.generate_content(
-        model='gemini-2.5-flash',
+        model='gemini-3.8-flash',
         contents=prompt_text,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
