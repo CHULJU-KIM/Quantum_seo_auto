@@ -133,7 +133,7 @@ if uploaded_file:
             st.error("⚠️ 왼쪽 설정창에 Gemini API 키를 먼저 입력해주세요.")
             st.stop()
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
         total_rows = len(df)
         results_map = {}
         
