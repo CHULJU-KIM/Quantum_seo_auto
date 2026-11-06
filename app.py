@@ -36,7 +36,7 @@ def clean_raw_title(text: str) -> str:
     text = re.sub(r'[^\w\s\d\.\*\-\/\+\%mlgLkgcmMM]', ' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
-def process_batch_gemini(client, batch_items: list[dict]) -> list[dict]:
+def process_batch_gemini(client, model_name: str, batch_items: list[dict], status_box) -> list[dict]:
     system_instruction = """
     너는 네이버 스마트스토어 및 쿠팡 무재고 위탁판매 전문 'SEO 및 키워드 최적화 엔진'이다.
     제공된 상품 리스트를 분석하여 각각의 row_id에 맞춰 아래 규칙을 엄격히 준수한 JSON을 반환하라.
@@ -53,20 +53,31 @@ def process_batch_gemini(client, batch_items: list[dict]) -> list[dict]:
     """
     prompt_text = "다음 상품 목록을 최적화하라:\n" + json.dumps(batch_items, ensure_ascii=False)
 
-    response = client.models.generate_content(
-        model='gemini-3.8-flash',
-        contents=prompt_text,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.2,
-            response_mime_type="application/json",
-            response_schema=BatchSEOResponse,
-        )
-    )
-    parsed = json.loads(response.text)
-    return parsed.get("results", [])
+    # 503 서버 과부하 및 429 할당량 지연 시 최대 4회 지수 백오프 자동 재시도
+    for attempt in range(4):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt_text,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.2,
+                    response_mime_type="application/json",
+                    response_schema=BatchSEOResponse,
+                )
+            )
+            parsed = json.loads(response.text)
+            return parsed.get("results", [])
+        except Exception as e:
+            err_msg = str(e)
+            if any(code in err_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]) and "402" not in err_msg:
+                if attempt < 3:
+                    wait_sec = 4 * (attempt + 1)
+                    status_box.warning(f"⏳ 구글 서버 대기열 혼잡으로 {wait_sec}초 후 자동 재시도합니다... ({attempt + 1}/3회)")
+                    time.sleep(wait_sec)
+                    continue
+            raise e
 
-# --- 사이드바: 기본 키 자동 작동 + 사용자 키 우선 덮어쓰기(Override) ---
 with st.sidebar:
     st.header("⚙️ 시스템 설정")
     
@@ -76,21 +87,36 @@ with st.sidebar:
         "🔑 내 Gemini API 키 입력 (선택)",
         type="password",
         placeholder="비워두면 기본 시스템 키로 작동",
-        help="본인 명의의 API 키를 입력하면 기본 키 대신 본인 키가 최우선으로 적용됩니다."
+        help="본인 명의의 무료 API 키를 입력하면 최우선으로 적용됩니다."
     )
     
     if user_input_key.strip():
         api_key = user_input_key.strip()
-        st.success("✅ 사용자 전용 API 키가 적용되었습니다.")
+        st.success("✅ 사용자 전용 API 키 적용됨")
     elif default_key:
         api_key = default_key
-        st.info("🟢 기본 제공 API 키로 작동 중입니다.")
+        st.info("🟢 기본 시스템 API 키 작동 중")
     else:
         api_key = ""
         st.warning("⚠️ API 키를 입력해주세요.")
+
+    # 모델 선택 옵션 (503 과부하 시 우회 가능하도록 설계)
+    model_choice = st.selectbox(
+        "🤖 AI 엔진 선택",
+        options=[
+            "gemini-3.8-flash",
+            "gemini-3.8-flash-lite",
+            "gemini-2.0-flash"
+        ],
+        index=0,
+        help="503 서버 혼잡 에러가 잦을 경우 더 가볍고 빠른 'lite' 모델을 선택하세요."
+    )
         
-    batch_size = st.slider("📦 묶음 처리 단위", min_value=5, max_value=30, value=15, step=5,
-                           help="한 번에 처리할 상품 개수입니다. 기본값(15개)을 권장합니다.")
+    batch_size = st.slider(
+        "📦 묶음 처리 단위", 
+        min_value=5, max_value=20, value=10, step=5,
+        help="무료 API 키 사용 시 5~10개로 설정하면 서버 과부하(503) 없이 가장 안정적으로 통과됩니다."
+    )
     st.markdown("---")
     st.caption("by **Quantum CJ**")
 
@@ -133,6 +159,7 @@ if uploaded_file:
             st.error("⚠️ 왼쪽 설정창에 Gemini API 키를 먼저 입력해주세요.")
             st.stop()
 
+        # v1beta 명시로 400 에러 원천 차단
         client = genai.Client(api_key=api_key, http_options={'api_version': 'v1beta'})
         total_rows = len(df)
         results_map = {}
@@ -153,14 +180,14 @@ if uploaded_file:
             status_text.info(f"⏳ AI가 상품명을 다듬고 있습니다... ({b_idx + 1}/{total_batches} 구간 처리 중)")
             
             try:
-                batch_res = process_batch_gemini(client, batch_slice)
+                batch_res = process_batch_gemini(client, model_choice, batch_slice, status_text)
                 for item in batch_res:
                     results_map[item['row_id']] = item
             except Exception as e:
-                st.error(f"⚠️ {b_idx + 1}구간 처리 중 일시적 오류 발생: {e}")
+                st.error(f"⚠️ {b_idx + 1}구간 처리 실패: {e}")
 
             progress_bar.progress((b_idx + 1) / total_batches)
-            time.sleep(0.5)
+            time.sleep(1.5)  # 무료 API 분당 호출 제한 및 503 방지용 안전 간격
 
         df['[AI] 1차정제_상품명'] = [item['raw_title'] for item in cleaned_items]
         df['[AI] 추천_카테고리'] = [results_map.get(i, {}).get('category', '미분류') for i in range(total_rows)]
